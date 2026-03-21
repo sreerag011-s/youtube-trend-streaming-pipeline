@@ -1,61 +1,146 @@
 import os
 import json
 import time
-from kafka import KafkaProducer
-from googleapiclient.discovery import build
+import logging
 from dotenv import load_dotenv
+from confluent_kafka import Producer
+from googleapiclient.discovery import build
+
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
 API_KEY = os.getenv("YOUTUBE_API_KEY")
-KAFKA_SERVER = os.getenv("KAFKA_SERVER")
+NICHE = os.getenv("YOUTUBE_NICHE")
 TOPIC = os.getenv("KAFKA_TOPIC")
+KAFKA_SERVER = os.getenv("KAFKA_SERVER")
+EVENT_HUB_CONNECTION_STRING = os.getenv("EVENT_HUB_CONNECTION_STRING")
+
+print("Kafka server:", KAFKA_SERVER)
+print("Topic:", TOPIC)
 
 youtube = build("youtube", "v3", developerKey=API_KEY)
 
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_SERVER,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
-)
+# Correct configuration for Azure Event Hub Kafka
+conf = {
+    "bootstrap.servers": KAFKA_SERVER,
+    "security.protocol": "SASL_SSL",
+    "sasl.mechanism": "PLAIN",
+    "sasl.username": "$ConnectionString",
+    "sasl.password": EVENT_HUB_CONNECTION_STRING,
+    "client.id": "youtube-producer"
+}
 
-MAX_BATCHES = 3
-SLEEP_TIME = 60
+producer = Producer(conf)
+
+processed_videos = set()
+
+
+def delivery_report(err, msg):
+    if err is not None:
+        print("Delivery failed:", err)
+    else:
+        print(
+            f"Delivered to {msg.topic()} "
+            f"[{msg.partition()}] offset {msg.offset()}"
+        )
+
+
+def send_event(event):
+
+    try:
+
+        producer.produce(
+            TOPIC,
+            key=event["video_id"],
+            value=json.dumps(event),
+            callback=delivery_report
+        )
+
+        producer.poll(0)
+
+    except BufferError:
+        print("Local producer queue full, flushing...")
+        producer.flush()
+
 
 def fetch_trending():
 
-    request = youtube.videos().list(
-        part="snippet,statistics",
-        chart="mostPopular",
-        regionCode="IN",
-        maxResults=25
-    )
+    print(f"\nFetching videos for niche: {NICHE}\n")
 
-    response = request.execute()
+    try:
 
-    for item in response["items"]:
+        search_request = youtube.search().list(
+            part="snippet",
+            q=NICHE,
+            type="video",
+            order="viewCount",
+            maxResults=10
+        )
 
-        video_data = {
+        search_response = search_request.execute()
 
-            "video_id": item["id"],
-            "title": item["snippet"]["title"],
-            "channel": item["snippet"]["channelTitle"],
-            "published_at": item["snippet"]["publishedAt"],
-            "views": item["statistics"].get("viewCount", 0),
-            "likes": item["statistics"].get("likeCount", 0)
+    except Exception as e:
+        print("YouTube API error:", e)
+        return
 
+    video_ids = []
+
+    for item in search_response.get("items", []):
+        video_ids.append(item["id"]["videoId"])
+
+    if not video_ids:
+        print("No videos returned from search")
+        return
+
+    try:
+
+        stats_request = youtube.videos().list(
+            part="snippet,statistics",
+            id=",".join(video_ids)
+        )
+
+        stats_response = stats_request.execute()
+
+    except Exception as e:
+        print("YouTube stats fetch failed:", e)
+        return
+
+    for video in stats_response.get("items", []):
+
+        video_id = video["id"]
+
+        if video_id in processed_videos:
+            continue
+
+        processed_videos.add(video_id)
+
+        event = {
+            "video_id": video_id,
+            "title": video["snippet"]["title"],
+            "channel": video["snippet"]["channelTitle"],
+            "published_at": video["snippet"]["publishedAt"],
+            "views": int(video["statistics"].get("viewCount", 0)),
+            "likes": int(video["statistics"].get("likeCount", 0)),
+            "niche": NICHE,
+            "ingestion_time": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        producer.send(TOPIC, video_data)
+        print("Sending event:", video_id)
 
-        print("Produced:", video_data)
+        send_event(event)
+
+    producer.flush()
 
 
-for batch in range(MAX_BATCHES):
+if __name__ == "__main__":
 
-    print(f"\nBatch {batch+1} running...\n")
+    for i in range(3):
 
-    fetch_trending()
+        fetch_trending()
 
-    time.sleep(SLEEP_TIME)
+        print("\nSleeping 60 seconds...\n")
 
-print("\nProducer finished.")
+        time.sleep(60)
+
+    producer.flush()
